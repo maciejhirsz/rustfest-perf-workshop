@@ -1,7 +1,5 @@
 #![cfg_attr(test, feature(test))]
 
-#[macro_use]
-extern crate combine;
 extern crate fnv;
 
 use std::borrow::Cow;
@@ -111,55 +109,184 @@ pub fn eval<'a>(program: &Ast<'a>, variables: &mut Cow<FnvHashMap<&'a str, Value
     }
 }
 
-parser! {
-    pub fn expr['a, I]()(I) -> Ast<'a> where [I: combine::Stream<Item = char, Range = &'a str> + combine::RangeStreamOnce] {
-        use combine::parser::range::{take_while, take_while1};
-        use combine::parser::char::*;
-        use combine::*;
+#[inline]
+fn skip_n<'a>(input: &mut &'a str, n: usize) {
+    *input = &input[n..];
+}
 
-        macro_rules! white {
-            ($prs:expr) => {
-                between(
-                    take_while(char::is_whitespace),
-                    take_while(char::is_whitespace),
-                    $prs,
-                )
-            };
-        }
+#[inline]
+fn skip_whitespace<'a>(input: &mut &'a str) {
+    let spaces = input.bytes().take_while(|&b| b <= 0x20).count();
 
-        let lambda = char('\\');
-        let eq = char('=');
-        let flse = string("#f").map(|_| Ast::Lit(::Value::False));
-        let ident = || white!(take_while1(char::is_alphabetic));
-        let function = (
-            white!(lambda),
-            white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
-            many::<Vec<_>, _>(expr()),
-        ).map(|(_, a, b)| Ast::Lit(::Value::Function(Func { arguments: a, body: b }.into())));
-        let define = (white!(eq), ident(), expr()).map(|(_, a, b)| Ast::Define(a, Box::new(b)));
-        let lit_num = take_while1(char::is_numeric)
-            .map(|i: &str| Ast::Lit(::Value::Int(i.parse().expect("Parsing integer failed"))));
-        let call = many1(expr()).map(Ast::Call);
+    skip_n(input, spaces);
+}
 
-        white!(choice!(
-            flse,
-            lit_num,
-            take_while1(char::is_alphabetic).map(Ast::Variable),
-            between(char('('), char(')'), choice!(function, define, call))
-        ))
+#[inline]
+fn read_byte<'a>(input: &mut &'a str, byte: u8) -> bool {
+    if input.as_bytes().get(0) == Some(&byte) {
+        skip_n(input, 1);
+
+        true
+    } else {
+        false
     }
+}
+
+#[inline]
+fn read_false<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    match input.as_bytes().get(1) {
+        Some(b'f') => {
+            skip_n(input, 2);
+
+            Some(Ast::Lit(Value::False))
+        },
+        _          => None,
+    }
+}
+
+fn read_nested<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    skip_n(input, 1);
+    skip_whitespace(input);
+
+    match input.as_bytes().get(0) {
+        Some(b'\\') => read_function(input),
+        Some(b'=') => read_define(input),
+        _ => read_call(input),
+    }
+}
+
+fn read_function<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    skip_n(input, 1);
+    skip_whitespace(input);
+
+    if !read_byte(input, b'(') { return None }
+
+    let mut arguments = Vec::new();
+    let mut body = Vec::new();
+
+    skip_whitespace(input);
+
+    while !read_byte(input, b')') {
+        arguments.push(read_ident(input)?);
+        skip_whitespace(input);
+    }
+
+    while !read_byte(input, b')') {
+        body.push(read_expr(input)?);
+        skip_whitespace(input);
+    }
+
+    Some(Ast::Lit(Value::Function(Func { arguments, body }.into())))
+}
+
+fn read_define<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    skip_n(input, 1);
+    skip_whitespace(input);
+
+    let var = read_ident(input)?;
+    let expression = read_expr(input)?;
+
+    skip_whitespace(input);
+    if !read_byte(input, b')') { return None }
+
+    Some(Ast::Define(var, Box::new(expression)))
+}
+
+fn read_call<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    let mut expressions = vec![read_expr(input)?];
+
+    skip_whitespace(input);
+
+    while !read_byte(input, b')') {
+        expressions.push(read_expr(input)?);
+        skip_whitespace(input);
+    }
+
+    Some(Ast::Call(expressions))
+}
+
+fn read_number<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    let mut result = 0u64;
+    let mut digits = 0;
+
+    for digit in input.bytes().take_while(|byte| match byte {
+        b'0'...b'9' => true,
+        _ => false,
+    }) {
+        result = ((digit - b'0') as u64) + result * 10;
+        digits += 1;
+    }
+
+    skip_n(input, digits);
+
+    Some(Ast::Lit(Value::Int(result)))
+}
+
+fn read_ident<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let letters = input.bytes().take_while(|&b| match b {
+        b'a'...b'z' |
+        b'A'...b'Z' => true,
+        _ => false
+    }).count();
+
+    let ident = &input[..letters];
+
+    skip_n(input, letters);
+
+    Some(ident)
+}
+
+fn read_expr<'a>(input: &mut &'a str) -> Option<Ast<'a>> {
+    skip_whitespace(input);
+
+    match input.as_bytes().get(0) {
+        Some(b'#') => read_false(input),
+        Some(b'0'...b'9') => read_number(input),
+        Some(b'a'...b'z') |
+        Some(b'A'...b'Z') => read_ident(input).map(Ast::Variable),
+        Some(b'(') => read_nested(input),
+
+        _ => None
+    }
+}
+
+pub fn parse<'a>(mut input: &'a str) -> Option<Ast<'a>> {
+    let result = read_expr(&mut input);
+
+    skip_whitespace(&mut input);
+
+    if input.len() != 0 {
+        panic!("got remainder:{}", input);
+    }
+
+    result
+}
+
+pub fn parse_lines<'a>(mut input: &'a str) -> Vec<Ast<'a>> {
+    let mut result = Vec::new();
+
+    while let Some(expression) = read_expr(&mut input) {
+        result.push(expression);
+    }
+
+    skip_whitespace(&mut input);
+
+    if input.len() != 0 {
+        panic!("got remainder:{}", input);
+    }
+
+    result
 }
 
 #[cfg(test)]
 mod benches {
     extern crate test;
 
-    use combine::Parser;
     use std::borrow::Cow;
 
     use self::test::{black_box, Bencher};
 
-    use super::{eval, expr, Value};
+    use super::{eval, Value, parse, parse_lines};
 
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
@@ -320,22 +447,27 @@ someval
     // Now we run the benchmarks. The parsing ones are very simple...
     #[bench]
     fn parse_deep_nesting(b: &mut Bencher) {
-        b.iter(|| black_box(expr().easy_parse(DEEP_NESTING)))
+        // b.iter(|| black_box(expr().easy_parse(DEEP_NESTING)))
+        b.iter(|| black_box(parse(DEEP_NESTING)))
     }
 
     #[bench]
     fn parse_many_variables(b: &mut Bencher) {
-        b.iter(|| black_box(expr().easy_parse(MANY_VARIABLES)))
+        // b.iter(|| black_box(expr().easy_parse(MANY_VARIABLES)))
+        b.iter(|| black_box(parse(MANY_VARIABLES)))
     }
 
     #[bench]
     fn parse_nested_func(b: &mut Bencher) {
-        b.iter(|| black_box(expr().easy_parse(NESTED_FUNC)))
+        // b.iter(|| black_box(expr().easy_parse(NESTED_FUNC)))
+        b.iter(|| black_box(parse(NESTED_FUNC)))
     }
 
     #[bench]
     fn parse_real_code(b: &mut Bencher) {
-        b.iter(|| black_box(expr().easy_parse(REAL_CODE)))
+        // b.iter(|| black_box(::combine::many1::<Vec<_>, _>(expr())
+        //     .easy_parse(REAL_CODE)))
+        b.iter(|| black_box(parse_lines(REAL_CODE)))
     }
 
     // We only test parsing for this one. We could test the speed of
@@ -353,7 +485,8 @@ someval
               90 91 92 93 94 95 96 97 98 99))
         ";
 
-        b.iter(|| black_box(expr().easy_parse(program_text)))
+        // b.iter(|| black_box(expr().easy_parse(program_text)))
+        b.iter(|| black_box(parse(program_text)))
     }
 
     // For the benchmarks that run the code we have to do a little more
@@ -375,7 +508,7 @@ someval
         let mut env = FnvHashMap::default();
         env.insert("test", Value::InbuiltFunc(callable));
 
-        let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
+        let program = parse(DEEP_NESTING).unwrap();
 
         b.iter(|| black_box(eval(&program, &mut Cow::Borrowed(&env))));
     }
@@ -390,9 +523,10 @@ someval
         env.insert("add", Value::InbuiltFunc(add));
         env.insert("if", Value::InbuiltFunc(if_));
 
-        let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
-            .easy_parse(REAL_CODE)
-            .unwrap();
+        // let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
+        //     .easy_parse(REAL_CODE)
+        //     .unwrap();
+        let program = parse_lines(REAL_CODE);
 
         b.iter(|| {
             let mut env = Cow::Borrowed(&env);
@@ -415,7 +549,8 @@ someval
             Value::Void
         }
 
-        let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
+        // let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
+        let program = parse(MANY_VARIABLES).unwrap();
 
         let mut env = FnvHashMap::default();
 
@@ -428,7 +563,7 @@ someval
     fn run_nested_func(b: &mut Bencher) {
         use fnv::FnvHashMap;
 
-        let (program, _) = expr().easy_parse(NESTED_FUNC).unwrap();
+        let program = parse(NESTED_FUNC).unwrap();
         let env = FnvHashMap::default();
         b.iter(|| black_box(eval(&program, &mut Cow::Borrowed(&env))));
     }
