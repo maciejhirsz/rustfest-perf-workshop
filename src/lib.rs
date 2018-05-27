@@ -113,15 +113,15 @@ pub fn eval<'a>(program: &Ast<'a>, variables: &mut Cow<FnvHashMap<&'a str, Value
 
 parser! {
     pub fn expr['a, I]()(I) -> Ast<'a> where [I: combine::Stream<Item = char, Range = &'a str> + combine::RangeStreamOnce] {
-        use combine::parser::range::recognize;
+        use combine::parser::range::{take_while, take_while1};
         use combine::parser::char::*;
         use combine::*;
 
         macro_rules! white {
             ($prs:expr) => {
                 between(
-                    skip_many(satisfy(char::is_whitespace)),
-                    skip_many(satisfy(char::is_whitespace)),
+                    take_while(char::is_whitespace),
+                    take_while(char::is_whitespace),
                     $prs,
                 )
             };
@@ -129,22 +129,22 @@ parser! {
 
         let lambda = char('\\');
         let eq = char('=');
-        let flse = white!(string("#f")).map(|_| Ast::Lit(::Value::False));
-        let ident = || white!(recognize(skip_many1(letter())).map(|chars: &str| chars));
+        let flse = string("#f").map(|_| Ast::Lit(::Value::False));
+        let ident = || white!(take_while1(char::is_alphabetic));
         let function = (
             white!(lambda),
             white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
             many::<Vec<_>, _>(expr()),
         ).map(|(_, a, b)| Ast::Lit(::Value::Function(Func { arguments: a, body: b }.into())));
         let define = (white!(eq), ident(), expr()).map(|(_, a, b)| Ast::Define(a, Box::new(b)));
-        let lit_num = recognize(skip_many1(digit()))
+        let lit_num = take_while1(char::is_numeric)
             .map(|i: &str| Ast::Lit(::Value::Int(i.parse().expect("Parsing integer failed"))));
-        let call = (many1(expr())).map(Ast::Call);
+        let call = many1(expr()).map(Ast::Call);
 
         white!(choice!(
             flse,
             lit_num,
-            ident().map(Ast::Variable),
+            take_while1(char::is_alphabetic).map(Ast::Variable),
             between(char('('), char(')'), choice!(function, define, call))
         ))
     }
